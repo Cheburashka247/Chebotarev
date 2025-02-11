@@ -1,0 +1,2041 @@
+import sqlite3
+import hashlib
+import time
+import random
+import qrcode
+import os
+from kivy.app import App
+from kivy.uix.camera import Camera
+from kivy.uix.screenmanager import ScreenManager, Screen
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+from kivy.uix.button import Button
+from kivy.uix.popup import Popup
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.image import Image
+from kivy.uix.spinner import Spinner
+from kivy.uix.checkbox import CheckBox
+import cv2
+from pyzbar.pyzbar import decode
+from datetime import datetime
+
+
+
+# Создаем или подключаемся к базе данных SQLite для бойцов и экипировки
+conn = sqlite3.connect('fighters.db')
+cursor = conn.cursor()
+
+# Создаем таблицу для бойцов
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS fighters (
+    id TEXT PRIMARY KEY,
+    callsign TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    first_name TEXT NOT NULL,
+    middle_name TEXT,
+    phone_number TEXT,
+    unit TEXT NOT NULL,
+    platoon TEXT NOT NULL,
+    position TEXT NOT NULL,
+    clothing_size TEXT,
+    shoe_size TEXT
+)
+''')
+
+# Создаем таблицу для экипировки
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS equipment (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL,
+    subcategory TEXT,
+    name TEXT NOT NULL,
+    number TEXT,
+    size TEXT,
+    subtype TEXT,
+    qr_path TEXT,
+    date_added TEXT,
+    manual_number TEXT,
+    is_issued INTEGER DEFAULT 0
+)
+''')
+conn.commit()
+
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS issued_equipment_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fighter_id INTEGER,
+        equipment_id INTEGER,
+        issue_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        return_date TIMESTAMP, 
+        return_notes TEXT, 
+        FOREIGN KEY(fighter_id) REFERENCES fighters(id),
+        FOREIGN KEY(equipment_id) REFERENCES equipment(id)
+    )
+''')
+conn.commit()
+
+# Функция для генерации индивидуального номера на основе данных бойца
+SECRET_KEY = "my_secret_key_1234"
+
+
+# Папка для сохранения QR-кодов
+QR_FOLDER = "qr_codes"
+os.makedirs(QR_FOLDER, exist_ok=True)  # Создаем папку, если она не существует
+
+
+def generate_fighter_id(callsign, unit, position):
+    salt = f"{random.randint(1000, 9999)}{time.time()}"
+    fighter_data = f"{callsign}{unit}{position}{salt}{SECRET_KEY}"
+    fighter_id = hashlib.sha256(fighter_data.encode()).hexdigest()[:15]
+    return fighter_id
+
+# Функция для генерации уникального номера экипировки
+def generate_equipment_number(name, equipment_type):
+    salt = f"{random.randint(1000, 9999)}{time.time()}"
+    equipment_data = f"{name}{equipment_type}{salt}{SECRET_KEY}"
+    equipment_number = hashlib.sha256(equipment_data.encode()).hexdigest()[:16]
+    return equipment_number
+
+
+# Хранение паролей
+ADMIN_PASSWORD = "admin123"
+USER_PASSWORD = "user123"
+
+# Экран для входа
+class LoginScreen(Screen):
+    def __init__(self, **kwargs):
+        super(LoginScreen, self).__init__(**kwargs)
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+        # Добавляем фоновое изображение
+        self.add_widget(Image(source='LOGO.jpg', allow_stretch=True, keep_ratio=False))
+
+        # Заголовок
+        layout.add_widget(Label(text="ВВЕДИТЕ ЛОГИН", size_hint=(0.4, 0.02), font_size=16))
+
+        # Поле для ввода логина
+        self.username_input = TextInput(multiline=False, size_hint=(0.4, 0.02), font_size=16)  # Меньший размер
+        layout.add_widget(self.username_input)
+
+        # Заголовок для пароля
+        layout.add_widget(Label(text="ВВЕДИТЕ ПАРОЛЬ", size_hint=(0.4, 0.02), font_size=16))
+
+        # Поле для ввода пароля
+        self.password_input = TextInput(multiline=False, password=True, size_hint=(0.4, 0.02), font_size=14)  # Меньший размер
+        layout.add_widget(self.password_input)
+
+        # Кнопка входа
+        login_button = Button(text="ВХОД", on_press=self.login, size_hint=(1, 0.05), font_size=12)  # Меньший размер кнопки
+        layout.add_widget(login_button)
+
+        # Кнопка выхода
+        logout_button = Button(text="ВЫХОД", on_press=self.logout, size_hint=(1, 0.05), font_size=12)  # Размер кнопки
+        layout.add_widget(logout_button)
+
+        # Добавляем layout на экран
+        self.add_widget(layout)
+
+    # Метод для выхода
+    def logout(self, instance):
+        App.get_running_app().stop()  # Останавливает приложение
+
+    def login(self, instance):
+        password = self.password_input.text
+
+        if password == ADMIN_PASSWORD:
+            self.manager.current = 'admin'  # Полный доступ
+        elif password == USER_PASSWORD:
+            self.manager.current = 'user'  # Ограниченный доступ
+        else:
+            popup = Popup(title="Ошибка", content=Label(text="Неверный пароль"), size_hint=(0.6, 0.4))
+            popup.open()
+
+# Экран с полным доступом (Админ)
+class AdminScreen(Screen):
+    def __init__(self, **kwargs):
+        super(AdminScreen, self).__init__(**kwargs)
+        self.selected_fighter_id = None
+        self.cart = {}  # Корзина для хранения выбранной экипировки
+        
+        self.conn = sqlite3.connect('fighters.db')
+        self.cursor = self.conn.cursor()
+        
+        layout = BoxLayout(orientation='vertical', padding=10)
+
+        add_fighter_btn = Button(text="Добавить бойца", on_press=self.add_fighter)
+        layout.add_widget(add_fighter_btn)
+
+        add_equipment_btn = Button(text="Добавить экипировку", on_press=self.add_equipment)
+        layout.add_widget(add_equipment_btn)
+
+        view_fighters_btn = Button(text="Просмотр личного состава", on_press=self.view_fighters)
+        layout.add_widget(view_fighters_btn)
+
+        view_equipment_btn = Button(text="Просмотр экипировки", on_press=self.view_equipment)
+        layout.add_widget(view_equipment_btn)
+
+        issue_equipment_btn = Button(text="Выдать экипировку", on_press=self.issue_equipment)
+        layout.add_widget(issue_equipment_btn)
+
+        view_log_btn = Button(text="Просмотр журнала выдачи", on_press=self.view_issued_equipment_log)
+        layout.add_widget(view_log_btn)
+
+        open_accept_form_window_btn = Button(text="Принять форму", on_press=self.open_accept_form_window)
+        layout.add_widget(open_accept_form_window_btn)
+
+        check_issues_button = Button(text="Журнал недочетов", on_press=self.open_issues_check_popup)
+        layout.add_widget(check_issues_button)
+        
+        # Кнопка выхода
+        exit_button = Button(text="Выход", on_press=self.confirm_exit)
+        layout.add_widget(exit_button)
+
+        self.add_widget(layout)
+
+    def confirm_exit(self, instance):
+        """
+        Открывает всплывающее окно с подтверждением выхода.
+        """
+        # Создаем окно подтверждения
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        layout.add_widget(Label(text="Вы уверены, что хотите выйти?"))
+
+        # Кнопка "Да"
+        yes_button = Button(text="Да")
+        yes_button.bind(on_press=self.exit_application)
+        layout.add_widget(yes_button)
+
+        # Кнопка "Нет"
+        no_button = Button(text="Нет")
+        no_button.bind(on_press=self.dismiss_popup)
+        layout.add_widget(no_button)
+
+        # Создаем и открываем Popup
+        self.popup = Popup(title="Подтверждение выхода", content=layout, size_hint=(0.6, 0.4))
+        self.popup.open()
+
+    def dismiss_popup(self, instance):
+        """Закрывает окно подтверждения выхода."""
+        self.popup.dismiss()
+
+    def exit_application(self, instance):
+        """
+        Сохраняет все данные и закрывает приложение.
+        """
+        # Закрытие приложения
+        self.conn.commit()  # Сохраняем изменения в базе данных
+        self.conn.close()   # Закрываем соединение с базой данных
+        App.get_running_app().stop()  # Останавливаем приложение
+
+    def open_accept_form_window(self, instance):
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+        fighter_btn = Button(text="Поиск по бойцу", on_press=lambda x: self.search_by_fighter())
+        layout.add_widget(fighter_btn)
+        
+        equipment_btn = Button(text="Поиск по номеру экипировки", on_press=lambda x: self.search_by_equipment())
+        layout.add_widget(equipment_btn)
+
+        scaner_button = Button(text="Сканировать QR-код", on_press=lambda x: self.scaner_qr_code())
+        layout.add_widget(scaner_button)
+
+        popup = Popup(title="Принять форму", content=layout, size_hint=(0.6, 0.6))
+        popup.open()    
+
+    def search_by_fighter(self):
+        layout = BoxLayout(orientation='vertical', padding=5, spacing=5)
+
+        # Поле для ввода позывного бойца с уменьшенным размером
+        search_input = TextInput(
+            hint_text="Введите часть позывного бойца", 
+            multiline=False, 
+            size_hint=(None, None),  # Отключаем размер по умолчанию (для обеих осей)
+            width=300,  # Устанавливаем ширину (можно настроить под нужды)
+            height=40   # Устанавливаем высоту
+        )
+        layout.add_widget(search_input)
+
+        # Отображение результатов поиска
+        results_layout = BoxLayout(orientation='vertical', size_hint_y=None)
+        results_layout.bind(minimum_height=results_layout.setter('height'))
+
+        scroll_view = ScrollView(size_hint=(1, 0.7))
+        scroll_view.add_widget(results_layout)
+        layout.add_widget(scroll_view)
+
+        def update_results(*args):
+            results_layout.clear_widgets()
+            callsign = search_input.text.strip()
+            if callsign:
+                # Запрос для поиска по позывному
+                self.cursor.execute("SELECT id, callsign FROM fighters WHERE callsign LIKE ?", (f"%{callsign}%",))
+                fighters = self.cursor.fetchall()
+
+                if fighters:
+                    for fighter_id, fighter_callsign in fighters:
+                        btn = Button(
+                            text=fighter_callsign,
+                            size_hint_y=None,
+                            height=40,
+                            on_press=lambda instance, fid=fighter_id: select_fighter(fid)
+                        )
+                        results_layout.add_widget(btn)
+                else:
+                    results_layout.add_widget(Label(text="Совпадений не найдено", size_hint_y=None, height=40))
+            else:
+                results_layout.add_widget(Label(text="Введите текст для поиска", size_hint_y=None, height=40))
+
+        def select_fighter(fighter_id):
+            popup.dismiss()
+            self.show_equipment_for_fighter(fighter_id)
+
+        # Привязка обновления списка результатов к вводу текста
+        search_input.bind(text=update_results)
+
+        # Инициализация результатов при открытии
+        update_results()
+
+        popup = Popup(title="Поиск по позывному бойца", content=layout, size_hint=(None, None),  # Устанавливаем размер вручную
+    size=(350, 150)) # Уменьшаем размер окна
+        popup.open()    
+
+    def search_by_equipment(self):
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+        # Поле для ввода номера экипировки
+        search_input = TextInput(hint_text="Введите номер экипировки", multiline=False)
+        search_button = Button(
+            text="Найти", 
+            on_press=lambda x: self.show_equipment_by_number(search_input.text)
+        )
+        layout.add_widget(search_input)
+        layout.add_widget(search_button)
+
+        popup = Popup(title="Поиск экипировки", content=layout, size_hint=(0.6, 0.6))
+        popup.open()
+
+    def scaner_qr_code(self):
+        """
+        Открывает камеру, сканирует QR-код и проверяет оборудование по ID.
+        """
+        try:
+            # Открываем камеру
+            cap = cv2.VideoCapture(0)
+            print("Запуск камеры. Наведите на QR-код.")
+            number = None
+
+            while True:
+                # Считываем кадры с камеры
+                ret, frame = cap.read()
+                if not ret:
+                    print("Ошибка доступа к камере. Проверьте подключение.")
+                    break
+
+                # Декодируем QR-коды с текущего кадра
+                decoded_objects = decode(frame)
+
+                for obj in decoded_objects:
+                    number = obj.data.decode("utf-8")  # Декодируем данные из QR-кода
+                    print(f"QR-код обнаружен: {number}")
+                    cap.release()  # Освобождаем камеру
+                    cv2.destroyAllWindows()  # Закрываем окна OpenCV
+                    self.check_equipment_by_number(number)  # Проверяем оборудование по ID
+                    return  # Завершаем функцию после успешного считывания
+
+                # Отображаем текущий кадр
+                cv2.imshow("Сканирование QR-кода (нажмите 'q' для выхода)", frame)
+
+                # Нажмите 'q', чтобы выйти из режима сканирования
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print("Выход из режима сканирования.")
+                    break
+
+            # Освобождаем ресурсы, если QR-код не найден
+            cap.release()
+            cv2.destroyAllWindows()
+
+            # Если QR-код не был найден
+            if number is None:
+                error_popup = Popup(
+                    title="QR-код не найден",
+                    content=Label(text="Не удалось обнаружить QR-код. Попробуйте снова."),
+                    size_hint=(0.6, 0.4)
+                )
+                error_popup.open()
+
+        except Exception as e:
+            error_popup = Popup(
+                title="Ошибка",
+                content=Label(text=f"Ошибка при сканировании QR-кода: {str(e)}"),
+                size_hint=(0.6, 0.4)
+            )
+            error_popup.open()
+
+    def check_equipment_by_number(self, number):
+        """
+        Проверяет наличие оборудования в базе данных по номеру, извлеченному из QR-кода.
+        Показывает, выдано ли оборудование, и если да, кому и когда.
+        Если не выдано, то показывает, что оно на складе.
+        """
+        try:
+            # Запрос к базе данных для получения информации об экипировке
+            self.cursor.execute('''
+                SELECT 
+                    equipment.id, 
+                    equipment.name, 
+                    equipment.number, 
+                    equipment.manual_number, 
+                    fighters.callsign, 
+                    issued_equipment_log.issue_date, 
+                    issued_equipment_log.return_date
+                FROM equipment
+                LEFT JOIN issued_equipment_log 
+                    ON equipment.id = issued_equipment_log.equipment_id
+                LEFT JOIN fighters 
+                    ON issued_equipment_log.fighter_id = fighters.id
+                WHERE equipment.number = ?
+                ORDER BY issued_equipment_log.issue_date DESC
+                LIMIT 1;
+            ''', (number,))
+
+            equipment = cursor.fetchone()
+
+            # Очищаем текущее окно перед отображением новой информации
+            layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+            if equipment:
+                # Данные из запроса
+                equipment_id = equipment[0]
+                equipment_name = equipment[1]
+                equipment_number = equipment[2]
+                equipment_manual_number = equipment[3]
+                fighter_callsign = equipment[4]
+                issue_date = equipment[5]
+                return_date = equipment[6]
+
+                # Проверяем статус экипировки
+                if issue_date:  # Если дата выдачи присутствует, экипировка выдана
+                    if return_date is None:  # Экипировка еще не возвращена
+                        status = f"Выдано бойцу: {fighter_callsign}" if fighter_callsign else "Боец: Неизвестен"
+                        issue_date_text = f"Дата выдачи: {issue_date}" if issue_date else "Дата выдачи: Неизвестна"
+                        equipment_info = f"Экипировка: {equipment_name}\nНомер: {equipment_manual_number}\nСгенерированный ID: {equipment_number}\n{status}\n{issue_date_text}"
+                    else:  # Если дата возврата есть, экипировка на складе
+                        status = "На складе"
+                        equipment_info = f"Экипировка: {equipment_name}\nНомер: {equipment_manual_number}\nСгенерированный ID: {equipment_number}\nСтатус: {status}"
+                else:  # Если дата выдачи отсутствует, экипировка на складе
+                    status = "На складе"
+                    equipment_info = f"Экипировка: {equipment_name}\nНомер: {equipment_manual_number}\nСгенерированный ID: {equipment_number}\nСтатус: {status}"
+
+                # Отображение информации об экипировке
+                layout.add_widget(Label(text=equipment_info))
+
+            else:
+                # Если экипировка не найдена
+                layout.add_widget(Label(text=f"Экипировка с номером '{number}' не найдена."))
+
+            # Создаём всплывающее окно с информацией
+            popup = Popup(title="Информация об экипировке", content=layout, size_hint=(0.9, 0.9))
+            popup.open()
+
+        except Exception as e:
+            error_popup = Popup(
+                title="Ошибка",
+                content=Label(text=f"Ошибка при проверке оборудования: {str(e)}"),
+                size_hint=(0.6, 0.4)
+            )
+            error_popup.open()
+
+    def show_equipment_by_number(self, number):
+        # Сохраняем текущий номер для последующего обновления интерфейса
+        self.current_number = number
+
+        # Запрос к базе данных для получения информации об экипировке
+        if number:  # Если передан обычный номер
+            self.cursor.execute('''
+                SELECT 
+                    equipment.id, 
+                    equipment.name, 
+                    equipment.number, 
+                    equipment.manual_number, 
+                    fighters.callsign, 
+                    issued_equipment_log.issue_date, 
+                    issued_equipment_log.return_date
+                FROM equipment
+                LEFT JOIN issued_equipment_log 
+                    ON equipment.id = issued_equipment_log.equipment_id
+                LEFT JOIN fighters 
+                    ON issued_equipment_log.fighter_id = fighters.id
+                WHERE equipment.number = ?
+                ORDER BY issued_equipment_log.issue_date DESC
+                LIMIT 1;
+            ''', (number,))
+        else:  # Если нет обычного номера, ищем по manual_number
+            self.cursor.execute('''
+                SELECT 
+                    equipment.id, 
+                    equipment.name, 
+                    equipment.number, 
+                    equipment.manual_number, 
+                    fighters.callsign, 
+                    issued_equipment_log.issue_date, 
+                    issued_equipment_log.return_date
+                FROM equipment
+                LEFT JOIN issued_equipment_log 
+                    ON equipment.id = issued_equipment_log.equipment_id
+                LEFT JOIN fighters 
+                    ON issued_equipment_log.fighter_id = fighters.id
+                WHERE equipment.manual_number = ?
+                ORDER BY issued_equipment_log.issue_date DESC
+                LIMIT 1;
+            ''', (number,))
+
+        equipment = self.cursor.fetchone()
+
+        # Очищаем текущее окно перед отображением новой информации
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+        if equipment:
+            # Данные из запроса
+            equipment_id = equipment[0]
+            equipment_name = equipment[1]
+            equipment_number = equipment[2]
+            equipment_manual_number = equipment[3]
+            fighter_callsign = equipment[4]
+            issue_date = equipment[5]
+            return_date = equipment[6]
+
+            # Проверяем статус экипировки
+            if issue_date:  # Если дата выдачи присутствует, экипировка выдана
+                if return_date is None:  # Экипировка еще не возвращена
+                    status = f"Выдано бойцу: {fighter_callsign}" if fighter_callsign else "Боец: Неизвестен"
+                    issue_date_text = f"Дата выдачи: {issue_date}" if issue_date else "Дата выдачи: Неизвестна"
+                    equipment_info = f"Экипировка: {equipment_name}\nНомер: {equipment_manual_number}\nСгенерированный ID: {equipment_number}\n{status}\n{issue_date_text}"
+                else:  # Если дата возврата есть, экипировка на складе
+                    status = "На складе"
+                    equipment_info = f"Экипировка: {equipment_name}\nНомер: {equipment_manual_number}\nСгенерированный ID: {equipment_number}\nСтатус: {status}"
+            else:  # Если дата выдачи отсутствует, экипировка на складе
+                status = "На складе"
+                equipment_info = f"Экипировка: {equipment_name}\nНомер: {equipment_manual_number}\nСгенерированный ID: {equipment_number}\nСтатус: {status}"
+
+            # Отображение информации об экипировке
+            layout.add_widget(Label(text=equipment_info))
+
+        else:
+            # Если экипировка не найдена
+            layout.add_widget(Label(text=f"Экипировка с номером '{number}' не найдена."))
+
+        # Создаём всплывающее окно с информацией
+        popup = Popup(title="Информация об экипировке", content=layout, size_hint=(0.9, 0.9))
+        popup.open()        
+
+    def issue_equipment(self, instance):
+        # Окно поиска бойца
+        layout = BoxLayout(orientation='vertical', padding=10)
+        layout.add_widget(Label(text="Введите часть позывного бойца:"))
+
+        callsign_input = TextInput()
+        layout.add_widget(callsign_input)
+
+        results_layout = BoxLayout(orientation='vertical', size_hint_y=None)
+        results_layout.bind(minimum_height=results_layout.setter('height'))
+        scroll_view = ScrollView(size_hint=(1, 0.7))
+        scroll_view.add_widget(results_layout)
+        layout.add_widget(scroll_view)
+
+        def update_results(*args):
+            results_layout.clear_widgets()
+            callsign = callsign_input.text
+            if callsign.strip():
+                self.cursor.execute("SELECT id, callsign FROM fighters WHERE callsign LIKE ?", (f"%{callsign}%",))
+                fighters = self.cursor.fetchall()
+                if fighters:
+                    for fighter_id, fighter_callsign in fighters:
+                        btn = Button(
+                            text=fighter_callsign,
+                            size_hint_y=None,
+                            height=40,
+                            on_press=lambda instance, fid=fighter_id: select_fighter(fid)
+                        )
+                        results_layout.add_widget(btn)
+                else:
+                    results_layout.add_widget(Label(text="Совпадений не найдено", size_hint_y=None, height=40))
+            else:
+                results_layout.add_widget(Label(text="Введите текст для поиска", size_hint_y=None, height=40))
+
+        def select_fighter(fighter_id):
+            self.selected_fighter_id = fighter_id
+            popup.dismiss()
+            self.select_category()
+
+        callsign_input.bind(text=update_results)
+        update_results()
+
+        popup = Popup(title="Выдача экипировки", content=layout, size_hint=(0.9, 0.9))
+        popup.open()
+
+
+    def scan_qr_code(self, instance):
+        """
+        Открывает камеру, сканирует QR-код и проверяет оборудование по ID.
+        """
+        try:
+            # Открываем камеру
+            cap = cv2.VideoCapture(0)
+            print("Запуск камеры. Наведите на QR-код.")
+            scanned_id = None
+
+            while True:
+                # Считываем кадры с камеры
+                ret, frame = cap.read()
+                if not ret:
+                    print("Ошибка доступа к камере. Проверьте подключение.")
+                    break
+
+                # Декодируем QR-коды с текущего кадра
+                decoded_objects = decode(frame)
+
+                for obj in decoded_objects:
+                    scanned_id = obj.data.decode("utf-8")  # Декодируем данные из QR-кода
+                    print(f"QR-код обнаружен: {scanned_id}")
+                    cap.release()  # Освобождаем камеру
+                    cv2.destroyAllWindows()  # Закрываем окна OpenCV
+                    self.check_equipment_by_id(scanned_id)  # Проверяем оборудование по ID
+                    return  # Завершаем функцию после успешного считывания
+
+                # Отображаем текущий кадр
+                cv2.imshow("Сканирование QR-кода (нажмите 'q' для выхода)", frame)
+
+                # Нажмите 'q', чтобы выйти из режима сканирования
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print("Выход из режима сканирования.")
+                    break
+
+            # Освобождаем ресурсы, если QR-код не найден
+            cap.release()
+            cv2.destroyAllWindows()
+
+            # Если QR-код не был найден
+            if scanned_id is None:
+                error_popup = Popup(
+                    title="QR-код не найден",
+                    content=Label(text="Не удалось обнаружить QR-код. Попробуйте снова."),
+                    size_hint=(0.6, 0.4)
+                )
+                error_popup.open()
+
+        except Exception as e:
+            error_popup = Popup(
+                title="Ошибка",
+                content=Label(text=f"Ошибка при сканировании QR-кода: {str(e)}"),
+                size_hint=(0.6, 0.4)
+            )
+            error_popup.open()
+
+    def check_equipment_by_id(self, equipment_id):
+        """
+        Проверяет наличие оборудования в базе данных по ID, извлеченному из QR-кода.
+        """
+        try:
+            # Ищем оборудование в базе данных по ID
+            self.cursor.execute("SELECT * FROM equipment WHERE number=?", (equipment_id,))
+            equipment = self.cursor.fetchone()
+
+            if equipment:
+                # Если найдено, добавляем в корзину
+                self.cart[equipment[0]] = equipment
+                confirmation_popup = Popup(
+                    title="Экипировка добавлена",
+                    content=Label(text=f"Экипировка '{equipment[3]}' (ID: {equipment[0]}) добавлена в корзину."),
+                    size_hint=(0.6, 0.4)
+                )
+                confirmation_popup.open()
+            else:
+                # Если не найдено
+                error_popup = Popup(
+                    title="Ошибка",
+                    content=Label(text=f"Экипировка с ID {equipment_id} не найдена."),
+                    size_hint=(0.6, 0.4)
+                )
+                error_popup.open()
+        except Exception as e:
+            error_popup = Popup(
+                title="Ошибка",
+                content=Label(text=f"Ошибка при проверке оборудования: {str(e)}"),
+                size_hint=(0.6, 0.4)
+            )
+            error_popup.open()  
+
+
+    def select_category(self):
+        # Окно выбора категории
+        layout = BoxLayout(orientation='vertical', padding=10)
+        categories = ['Одежда', 'Обувь', 'Защита', 'Оружие', 'Аптечка', 'Рюкзак', 'Рация', 'Прочее']
+        
+        for category in categories:
+            btn = Button(text=category, on_press=lambda instance, cat=category: self.select_subcategory(cat))
+            layout.add_widget(btn)
+
+        # Кнопка для просмотра корзины
+        view_cart_btn = Button(text="Просмотр корзины", on_press=self.view_cart)
+        layout.add_widget(view_cart_btn)
+
+        scan_qr_btn = Button(text="Сканировать QR-код", size_hint_y=None, height=50, on_press=self.scan_qr_code)
+        layout.add_widget(scan_qr_btn)
+
+        popup = Popup(title="Выбор категории", content=layout, size_hint=(0.9, 0.9))
+        popup.open()   
+    
+
+    def select_subcategory(self, category):
+        # Окно выбора подкатегории для выбранной категории
+        layout = BoxLayout(orientation='vertical', padding=10)
+        
+        subcategories = {
+            'Одежда': ['Головной убор', 'Кофта', 'Форма', 'Нательное белье', 'Прочее'],
+            'Обувь': ['Берцы', 'Кроссовки', 'Сапоги'],
+            'Защита': ['Каска', 'Бронежилет']
+        }
+        
+        if category in subcategories:
+            for subcat in subcategories[category]:
+                btn = Button(text=subcat, on_press=lambda instance, cat=category, sub=subcat: self.display_equipment(cat, sub))
+                layout.add_widget(btn)
+        else:
+            self.display_equipment(category)
+
+        popup = Popup(title=f"Выбор подкатегории для {category}", content=layout, size_hint=(0.9, 0.9))
+        popup.open()
+
+    def display_equipment(self, category, subcategory=None):
+        # Основной вертикальный контейнер
+        main_layout = BoxLayout(orientation='vertical', padding=10)
+
+        # Получение данных из базы
+        query = "SELECT * FROM equipment WHERE category=?"
+        params = (category,)
+        if subcategory:
+            query += " AND subcategory=?"
+            params += (subcategory,)
+
+        self.cursor.execute(query, params)
+        equipment = self.cursor.fetchall()
+
+        # Установим заголовки для каждой категории
+        headers = []
+        if category == 'Одежда':
+            headers = ["Название", "Размер", "Тип (зима, лето, межсезонье)", "Дата поставки"]
+        elif category == 'Обувь':
+            headers = ["Название", "Размер", "Тип обуви", "Сезон", "Дата поставки"]
+        elif category == 'Защита':
+            headers = ["Название", "Размер", "Тип плит", "ID", "Дата поставки"]
+        elif category == 'Оружие':
+            headers = ["Название", "Номер", "Индивидуальный ID", "Тип оружия", "Дата поставки"]
+        elif category == 'Аптечка':
+            headers = ["Название", "Индивидуальный ID", "Дата поставки"]
+        elif category == 'Рюкзак':
+            headers = ["Название", "Индивидуальный ID", "Тип рюкзака", "Дата поставки"]
+        elif category == 'Рация':
+            headers = ["Название", "Номер", "Тип рации", "Индивидуальный ID", "Дата поставки"]
+        elif category == 'Прочее':
+            headers = ["Название", "Дата поставки"]
+
+        # Если данных нет
+        if not equipment:
+            layout = BoxLayout(orientation='vertical', padding=10)
+            layout.add_widget(Label(text="Нет доступной экипировки.", size_hint_y=None, height=50))
+            back_to_category_btn = Button(text="Назад к категориям", size_hint_y=None, height=50,
+                                        on_press=lambda instance: self.select_category())
+            layout.add_widget(back_to_category_btn)
+            popup = Popup(title="Выбор экипировки", content=layout, size_hint=(0.8, 0.4))
+            popup.open()
+            return
+
+        # Добавляем заголовок таблицы
+        header_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=30, padding=[5, 0, 5, 0])
+        for field in headers:
+            label = Label(text=field, bold=True, halign='center', valign='middle', size_hint_x=1)
+            label.bind(size=lambda *args: label.setter('text_size')(label, label.size))
+            header_layout.add_widget(label)
+        main_layout.add_widget(header_layout)
+
+        # Прокручиваемая область для списка экипировки
+        scroll_view = ScrollView(size_hint=(1, 1), bar_width=10)
+
+        # Внутренний контейнер для строк экипировки
+        equipment_layout = BoxLayout(orientation='vertical', size_hint_y=None)
+        equipment_layout.bind(minimum_height=equipment_layout.setter('height'))
+
+        highlight_categories = ['Оружие', 'Аптечка', 'Рация', 'Защита', 'Рюкзак']
+
+        for item in equipment:
+        # Проверяем, принадлежит ли категория к выделенному списку и не выдан ли элемент
+            if item[1] not in highlight_categories and item[10] == 1:
+                continue  # Если категория не входит в список и элемент выдан, пропускаем его
+
+            row_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+
+            # Переменная name_color должна быть определена заранее
+            name_color = [1, 1, 1, 1]  # Цвет по умолчанию для невыделенных категорий
+
+            # Добавляем чекбокс для каждой строки
+            checkbox = CheckBox(size_hint_x=None, width=30)
+
+            # Проверка на статус выдано
+            if item[10] == 1:  # Если элемент уже выдан
+                checkbox.disabled = True  # Запрещаем повторную выдачу
+                name_color = [0.8, 0.2, 0.2, 1]  # Подсветить красным
+            else:
+                checkbox.disabled = False  # Разрешаем выбор
+                name_color = [1, 1, 1, 1]  # Обычный цвет
+
+            # Привязка обработки выбора к чекбоксу
+            checkbox.bind(active=lambda checkbox, active, item=item: self.update_cart(item, active))
+            row_layout.add_widget(checkbox)
+
+            # Добавляем данные в строки в соответствии с заголовками
+            for header in headers:
+                value = ""
+                if header == "Название":
+                    value = item[3]  
+                elif header == "Размер":
+                    value = item[5] if item[5] else "Размер не указан"
+                elif header == "Тип (зима, лето, межсезонье)":
+                    value = item[6] if item[6] else "Тип не указан"
+                elif header == "Тип обуви":
+                    value = item[6] if item[6] else "Тип обуви не указан"
+                elif header == "Сезон":
+                    value = item[7] if item[7] else "Сезон не указан"
+                elif header == "Тип плит":
+                    value = item[6] if item[6] else "Тип плит не указан"
+                elif header == "Индивидуальный ID":
+                    value = item[4] if item[4] else "ID номер не найден"
+                elif header == "Номер":
+                    value = item[9] if item[9] else "Номер не указан"
+                elif header == "Тип оружия":
+                    value = item[6] if item[6] else "Тип оружия не указан"
+                elif header == "Тип рации":
+                    value = item[6] if item[6] else "Тип рации не указан"
+                elif header == "Тип рюкзака":
+                    value = item[6] if item[6] else "Тип рюкзака не указан"
+                elif header == "Дата поставки":
+                    value = item[8] if item[8] else "Дата не указана"
+
+                # Создаем новый Label для каждого значения
+                label = Label(text=str(value), color=name_color, halign='center', valign='middle', size_hint_x=1)
+                label.bind(size=lambda *args: label.setter('text_size')(label, label.size))
+                row_layout.add_widget(label)
+
+            # Добавляем строку в основной контейнер
+            equipment_layout.add_widget(row_layout)
+
+        # Добавляем прокручиваемый контейнер
+        scroll_view.add_widget(equipment_layout)
+        main_layout.add_widget(scroll_view)
+
+        # Кнопка для возврата к выбору категории
+        back_to_category_btn = Button(text="Назад к категориям", size_hint_y=None, height=50, on_press=lambda instance: self.select_category())
+        main_layout.add_widget(back_to_category_btn)
+
+        popup = Popup(title="Выбор экипировки", content=main_layout, size_hint=(0.9, 0.9))
+        popup.open()
+
+    def update_cart(self, item, active):
+        # Обновление корзины: добавление или удаление предмета
+        if active:
+            self.cart[item[0]] = item  # Сохраняем по ID предмета
+        else:
+            if item[0] in self.cart:
+                del self.cart[item[0]]
+
+    def view_cart(self, *args):
+        # Отображение корзины
+        main_layout = BoxLayout(orientation='vertical', padding=10)
+
+        # Прокручиваемая область для корзины
+        scroll_view = ScrollView(size_hint=(1, 0.8), bar_width=10)
+        cart_layout = BoxLayout(orientation='vertical', size_hint_y=None)
+        cart_layout.bind(minimum_height=cart_layout.setter('height'))
+
+        # Если корзина пуста
+        if not self.cart:
+            cart_layout.add_widget(Label(text="Корзина пуста.", size_hint_y=None, height=50))
+        else:
+            # Отображаем содержимое корзины
+            for item_id, item in self.cart.items():
+                row_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+
+                # Формат отображения элемента (как при выборе)
+                for i, field in enumerate(["Название", "Номер", "Размер"]):
+                    value = item[i + 3] if field != "Размер" else item[5]  # Размер - в индексе 5
+                    label = Label(text=str(value), halign='center', valign='middle', size_hint_x=1)
+                    label.bind(size=lambda *args: label.setter('text_size')(label, label.size))
+                    row_layout.add_widget(label)
+
+                # Кнопка для удаления элемента
+                remove_btn = Button(text="Удалить", size_hint_x=None, width=80)
+                remove_btn.bind(on_press=lambda instance, item_id=item_id: self.confirm_remove_from_cart(item_id))
+                row_layout.add_widget(remove_btn)
+
+                cart_layout.add_widget(row_layout)
+
+        scroll_view.add_widget(cart_layout)
+        main_layout.add_widget(scroll_view)
+
+        # Кнопка завершения выдачи
+        issue_btn = Button(text="Выдать экипировку", size_hint_y=None, height=50)
+        issue_btn.bind(on_press=self.finalize_issue)
+        main_layout.add_widget(issue_btn)
+
+        # Кнопка закрытия окна
+        close_btn = Button(text="Закрыть корзину", size_hint_y=None, height=50)
+        close_btn.bind(on_press=lambda instance: self.close_cart())
+        main_layout.add_widget(close_btn)
+
+        # Открытие окна корзины
+        self.cart_popup = Popup(title="Корзина", content=main_layout, size_hint=(0.9, 0.9))
+        self.cart_popup.open()
+
+    def finalize_issue(self, *args):
+        # Проверяем, пуста ли корзина перед выдачей
+        if not self.cart:
+            # Если корзина пуста, показываем сообщение и не выполняем выдачу
+            confirmation_popup = Popup(title="Ошибка", content=Label(text="Корзина пуста. Невозможно выдать экипировку."), size_hint=(0.5, 0.5))
+            confirmation_popup.open()
+            return
+
+        # Проходим по корзине и отмечаем каждую выданную вещь
+        for item in self.cart.values():
+            # Добавляем в журнал выдачи
+            self.cursor.execute("INSERT INTO issued_equipment_log (fighter_id, equipment_id) VALUES (?, ?)",
+                                (self.selected_fighter_id, item[0]))
+
+            # Отмечаем вещь как выданную в таблице equipment
+            self.cursor.execute("UPDATE equipment SET is_issued = 1 WHERE id = ?", (item[0],))
+
+        self.conn.commit()
+
+        # Очищаем корзину после выдачи
+        self.cart.clear()
+        confirmation_popup = Popup(title="Выдача завершена", content=Label(text="Экипировка выдана и сохранена в журнале."), size_hint=(0.5, 0.5))
+        confirmation_popup.open()
+
+    def close_cart(self):
+        """Закрытие корзины и переход к выбору подкатегории"""
+        if hasattr(self, 'cart_popup') and self.cart_popup:
+            self.cart_popup.dismiss()
+
+        # Переход к окну выбора экипировки
+        self.view_equipment()  
+
+    def view_issued_equipment_log(self, *args):
+        layout = BoxLayout(orientation='vertical', padding=10)
+        
+        # Прокручиваемая область для списка бойцов
+        bcy_layout = GridLayout(cols=1, spacing=10, size_hint_y=None)
+        bcy_layout.bind(minimum_height=bcy_layout.setter('height'))
+        
+        self.cursor.execute('''
+            SELECT fighters.id, fighters.callsign
+            FROM fighters
+            ORDER BY fighters.callsign ASC
+        ''')
+        fighters = self.cursor.fetchall()
+
+        # Добавляем кнопки для каждого бойца
+        for fighter in fighters:
+            fighter_button = Button(text=f"Боец: {fighter[1]}", size_hint_y=None, height=40)
+            fighter_button.bind(on_press=lambda instance, fighter_id=fighter[0]: self.show_equipment_for_fighter(fighter_id))
+            bcy_layout.add_widget(fighter_button)
+
+        # Добавляем список бойцов в прокручиваемую область
+        bcy_scroll = ScrollView(size_hint=(1, 0.8), bar_width=10)
+        bcy_scroll.add_widget(bcy_layout)
+        layout.add_widget(bcy_scroll)
+        
+        # Кнопка для закрытия окна
+        close_button = Button(text="Закрыть", size_hint_y=None, height=40, on_press=lambda x: popup.dismiss())
+        layout.add_widget(close_button)
+
+        # Окно с журналом
+        popup = Popup(title="Журнал выданной экипировки", content=layout, size_hint=(0.9, 0.9))
+        popup.open()
+
+    def show_equipment_for_fighter(self, fighter_id):
+        # Основной макет окна
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+        # Список категорий, которые можно сдавать
+        highlight_categories = ['Оружие', 'Аптечка', 'Рация', 'Защита', 'Рюкзак']
+
+        # Заголовки
+        header_layout = GridLayout(cols=6, size_hint_y=None, height=40, spacing=10)
+        header_layout.add_widget(Label(text="Название", bold=True, size_hint_x=0.3, halign="center"))
+        header_layout.add_widget(Label(text="Номер", bold=True, size_hint_x=0.1, halign="center"))
+        header_layout.add_widget(Label(text="Размер", bold=True, size_hint_x=0.1, halign="center"))
+        header_layout.add_widget(Label(text="Дата выдачи", bold=True, size_hint_x=0.2, halign="center"))
+        header_layout.add_widget(Label(text="Дата сдачи", bold=True, size_hint_x=0.2, halign="center"))
+        header_layout.add_widget(Label(text="Действия", bold=True, size_hint_x=0.2, halign="center"))
+        layout.add_widget(header_layout)
+
+        # Прокручиваемая область для данных
+        equipment_scroll = ScrollView(size_hint=(1, 0.8), bar_width=10)
+        equipment_layout = GridLayout(cols=6, spacing=10, size_hint_y=None, row_default_height=40)
+        equipment_layout.bind(minimum_height=equipment_layout.setter('height'))
+
+        # Получаем экипировку для выбранного бойца
+        self.cursor.execute('''
+            SELECT equipment.name, 
+                issued_equipment_log.issue_date, 
+                equipment.id, 
+                equipment.size, 
+                issued_equipment_log.id, 
+                issued_equipment_log.return_date,
+                issued_equipment_log.return_notes,
+                equipment.category
+            FROM issued_equipment_log
+            JOIN equipment ON issued_equipment_log.equipment_id = equipment.id
+            WHERE issued_equipment_log.fighter_id = ?
+            ORDER BY issued_equipment_log.issue_date DESC
+        ''', (fighter_id,))
+        equipment_logs = self.cursor.fetchall()
+
+        if not equipment_logs:
+            # Если нет экипировки, отображаем сообщение
+            equipment_layout.add_widget(Label(text="Экипировка не выдана.", size_hint_x=1, height=40, halign="center"))
+        else:
+            # Добавляем строки с данными
+            for log in equipment_logs:
+                equipment_layout.add_widget(Label(text=log[0], size_hint_x=0.3, halign="center"))  # Название
+                equipment_layout.add_widget(Label(text=str(log[2]), size_hint_x=0.1, halign="center"))  # Номер
+                equipment_layout.add_widget(Label(text=log[3] if log[3] is not None else "Не указан", size_hint_x=0.1, halign="center"))  # Размер
+                equipment_layout.add_widget(Label(text=log[1], size_hint_x=0.2, halign="center"))  # Дата выдачи
+
+                # Добавляем колонку "Дата сдачи"
+                return_date = log[5] if log[5] is not None else "Не сдано"
+                equipment_layout.add_widget(Label(text=return_date, size_hint_x=0.2, halign="center"))  # Дата сдачи
+
+                # Проверяем, была ли экипировка сдана
+                if log[5] is not None:  # Если есть дата сдачи
+                    # Кнопка "Посмотреть замечания"
+                    view_notes_button = Button(text="Посмотреть замечания", size_hint_x=0.2)
+                    view_notes_button.bind(on_press=lambda x, notes=log[6]: self.show_notes(notes))
+                    equipment_layout.add_widget(view_notes_button)
+                else:
+                    # Если категория разрешена для сдачи, отображаем кнопку "Сдать"
+                    category = log[7]  # Категория из базы данных
+                    if category in highlight_categories:
+                        return_button = Button(text="Сдать", size_hint_x=0.2)
+                        return_button.bind(on_press=lambda x, log_id=log[4]: self.return_equipment(log_id, fighter_id))
+                        equipment_layout.add_widget(return_button)
+                    else:
+                        # Если категория не разрешена, оставляем пустую ячейку
+                        equipment_layout.add_widget(Label(text="", size_hint_x=0.2))
+
+        # Добавляем макет с данными в прокрутку
+        equipment_scroll.add_widget(equipment_layout)
+        layout.add_widget(equipment_scroll)
+
+        # Кнопка для закрытия окна
+        close_button = Button(text="Закрыть", size_hint_y=None, height=40, on_press=lambda x: equipment_popup.dismiss())
+        layout.add_widget(close_button)
+
+        # Окно для экипировки
+        equipment_popup = Popup(title="Экипировка бойца", content=layout, size_hint=(0.9, 0.9))
+        equipment_popup.open()
+
+    def return_equipment(self, log_id, fighter_id):
+        # Окно для сдачи экипировки
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+        # Поле для ввода замечаний
+        notes_input = TextInput(hint_text="Введите замечания о форме (если есть)", multiline=True)
+
+        # Кнопка подтверждения
+        confirm_button = Button(text="Подтвердить сдачу", size_hint_y=None, height=40)
+        confirm_button.bind(on_press=lambda x: self.confirm_return(log_id, notes_input.text, fighter_id, return_popup))
+
+        layout.add_widget(Label(text="Добавьте замечания о сданной форме:"))
+        layout.add_widget(notes_input)
+        layout.add_widget(confirm_button)
+
+        return_popup = Popup(title="Сдача экипировки", content=layout, size_hint=(0.8, 0.6))
+        return_popup.open()
+
+    def show_notes(self, notes):
+        # Окно для просмотра замечаний
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        layout.add_widget(Label(text="Замечания:", size_hint_y=None, height=40))
+        layout.add_widget(Label(text=notes if notes else "Замечаний нет.", text_size=(400, None), halign="left"))
+
+        close_button = Button(text="Закрыть", size_hint_y=None, height=40)
+        close_button.bind(on_press=lambda x: notes_popup.dismiss())
+        layout.add_widget(close_button)
+
+        notes_popup = Popup(title="Замечания при сдаче", content=layout, size_hint=(0.6, 0.4))
+        notes_popup.open() 
+
+    # Основной интерфейс
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+        # Кнопка для проверки журнала недочетов
+        check_issues_button = Button(text="Проверить журнал недочетов")
+        check_issues_button.bind(on_press=self.open_issues_check_popup)
+        layout.add_widget(check_issues_button)
+
+        return layout
+
+    def open_issues_check_popup(self, instance):
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+        # Поле для ввода номера экипировки
+        manual_number_input = TextInput(hint_text="Введите номер экипировки", multiline=False)
+        layout.add_widget(manual_number_input)
+
+        # Кнопка для выполнения поиска
+        search_button = Button(text="Искать")
+        layout.add_widget(search_button)
+
+        # Создаём всплывающее окно
+        popup = Popup(title="Проверить журнал недочетов", content=layout, size_hint=(0.8, 0.4))
+
+        # Обработчик кнопки "Искать"
+        def handle_search(instance):
+            manual_number = manual_number_input.text.strip()
+            if manual_number:
+                popup.dismiss()
+                self.check_issues(manual_number)
+            else:
+                manual_number_input.hint_text = "Введите корректный номер!"
+
+        search_button.bind(on_press=handle_search)
+        popup.open()
+
+    def check_issues(self, manual_number):
+        # Запрос к базе данных для поиска всех записей
+        self.cursor.execute('''
+            SELECT 
+                issued_equipment_log.issue_date,
+                issued_equipment_log.return_date,
+                fighters.callsign,
+                issued_equipment_log.return_notes,
+                equipment.name -- Добавляем название оборудования
+            FROM issued_equipment_log
+            JOIN equipment ON issued_equipment_log.equipment_id = equipment.id
+            LEFT JOIN fighters ON issued_equipment_log.fighter_id = fighters.id
+            WHERE equipment.manual_number = ?
+            ORDER BY issued_equipment_log.issue_date ASC;
+        ''', (manual_number,))
+        records = self.cursor.fetchall()
+
+        # Формируем содержимое
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        
+        # Создаем заголовок в центре
+        equipment_name = records[0][4] if records else 'Неизвестное оборудование'
+        header = Label(
+            text=f"Журнал недочетов для экипировки № {manual_number}\n({equipment_name})", 
+            size_hint_y=None, 
+            height=40,
+            halign='center', 
+            valign='middle',
+            font_size=18
+        )
+        layout.add_widget(header)
+
+        # Создаем таблицу
+        table_layout = GridLayout(cols=4, size_hint_y=None, row_default_height=40, padding=[10, 10, 10, 10], spacing=10)
+        table_layout.bind(minimum_height=table_layout.setter('height'))
+
+        # Заголовки таблицы
+        table_layout.add_widget(Label(text="Дата выдачи", bold=True, halign='center'))
+        table_layout.add_widget(Label(text="Дата сдачи", bold=True, halign='center'))
+        table_layout.add_widget(Label(text="Кому выдано", bold=True, halign='center'))
+        table_layout.add_widget(Label(text="Недочеты", bold=True, halign='center'))
+
+        # Добавляем строки с данными
+        if records:
+            for record in records:
+                issue_date = record[0]
+                return_date = record[1] or "Не возвращено"
+                callsign = record[2] or "Неизвестен"
+                return_notes = record[3] or "Нет недочетов"
+                
+                table_layout.add_widget(Label(text=str(issue_date), halign='center', valign='middle'))
+                table_layout.add_widget(Label(text=str(return_date), halign='center', valign='middle'))
+                table_layout.add_widget(Label(text=str(callsign), halign='center', valign='middle'))
+                table_layout.add_widget(Label(text=str(return_notes), halign='center', valign='middle'))
+
+        else:
+            # Если данных нет, создаём строку с сообщением
+            table_layout.add_widget(Label(text="Нет данных по данной экипировке", halign='center', valign='middle'))
+            # Пустые столбцы для выравнивания
+            for _ in range(3):
+                table_layout.add_widget(Label(text=""))
+
+        # Создаём прокручиваемый виджет для таблицы
+        scroll_view = ScrollView(size_hint=(1, None), size=(800, 400))  # Ограничение высоты окна
+        scroll_view.add_widget(table_layout)
+
+        # Добавляем таблицу в основной макет
+        layout.add_widget(scroll_view)
+
+        # Создаём всплывающее окно с результатами
+        popup = Popup(
+            title="Результаты поиска",
+            content=layout,
+            size_hint=(0.9, 0.9),
+            auto_dismiss=True
+        )
+        popup.open()     
+
+    # Методы для работы с базой данных
+
+    def confirm_return(self, log_id, notes, fighter_id, popup):
+        # Обновляем запись в базе данных
+        self.cursor.execute('''
+            UPDATE issued_equipment_log
+            SET return_date = CURRENT_TIMESTAMP, return_notes = ?
+            WHERE id = ?
+        ''', (notes, log_id))
+
+        # Устанавливаем оборудование как доступное для выдачи
+        self.cursor.execute('''
+            UPDATE equipment
+            SET is_issued = 0
+            WHERE id = (SELECT equipment_id FROM issued_equipment_log WHERE id = ?)
+        ''', (log_id,))
+
+        self.conn.commit()
+        popup.dismiss()
+        self.show_popup("Успех", "Экипировка успешно возвращена.")
+
+        # Обновляем список экипировки
+        self.show_equipment_for_fighter(fighter_id)
+  
+
+    def show_popup(self, title, message):
+        # Простое окно с сообщением
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        layout.add_widget(Label(text=message))
+        close_button = Button(text="Закрыть", size_hint_y=None, height=40)
+        close_button.bind(on_press=lambda x: popup.dismiss())
+        layout.add_widget(close_button)
+
+        popup = Popup(title=title, content=layout, size_hint=(0.8, 0.6))
+        popup.open()
+
+    def get_fighters(self):
+        self.cursor.execute("SELECT callsign FROM fighters")
+        return [row[0] for row in self.cursor.fetchall()]
+
+    def get_equipments(self):
+        self.cursor.execute("SELECT name FROM equipment")
+        return [row[0] for row in self.cursor.fetchall()]
+
+    def get_equipment_quantity(self, equipment_name):
+        self.cursor.execute("SELECT number FROM equipment WHERE name=?", (equipment_name,))
+        result = self.cursor.fetchone()
+        return int(result[0]) if result else 0
+
+    def update_equipment_quantity(self, equipment_name, new_quantity):
+        self.cursor.execute("UPDATE equipment SET number=? WHERE name=?", (new_quantity, equipment_name))
+        self.conn.commit()
+
+
+    def add_fighter(self, instance):
+        content = BoxLayout(orientation='vertical', padding=5)
+
+        content.add_widget(Label(text="Введите данные бойца", font_size=20, size_hint=(1, 0.5)))
+
+        self.last_name_input = TextInput(hint_text="Фамилия")
+        content.add_widget(self.last_name_input)
+
+        self.first_name_input = TextInput(hint_text="Имя")
+        content.add_widget(self.first_name_input)
+
+        self.middle_name_input = TextInput(hint_text="Отчество")
+        content.add_widget(self.middle_name_input)
+
+        self.phone_number_input = TextInput(hint_text="Номер телефона")
+        content.add_widget(self.phone_number_input)
+
+        self.callsign_input = TextInput(hint_text="Позывной")
+        content.add_widget(self.callsign_input)
+
+        self.unit_input = TextInput(hint_text="Рота")
+        content.add_widget(self.unit_input)
+
+        self.platoon_input = TextInput(hint_text="Взвод")
+        content.add_widget(self.platoon_input)
+
+        self.position_input = TextInput(hint_text="Должность")
+        content.add_widget(self.position_input)
+
+        content.add_widget(Label(text="Введите размеры", font_size=20, size_hint=(1, 0.5)))
+
+        self.clothing_size_input = TextInput(hint_text="Размер одежды")
+        content.add_widget(self.clothing_size_input)
+
+        self.shoe_size_input = TextInput(hint_text="Размер обуви")
+        content.add_widget(self.shoe_size_input)
+
+        add_button = Button(text="Добавить", on_press=self.save_fighter)
+        content.add_widget(add_button)
+
+        self.popup = Popup(title="Добавить бойца", content=content, size_hint=(0.8, 0.9))
+        self.popup.open()
+
+        # Кнопка "Назад" для закрытия окна без сохранения
+        back_button = Button(text="Назад", on_press=self.close_popup)
+        content.add_widget(back_button)
+
+    def close_popup(self, instance):
+        """Функция для закрытия всплывающего окна без сохранения данных."""
+        if hasattr(self, 'popup'):
+            self.popup.dismiss()
+
+
+    def save_fighter(self, instance):
+        last_name = self.last_name_input.text
+        first_name = self.first_name_input.text
+        middle_name = self.middle_name_input.text
+        phone_number = self.phone_number_input.text
+        callsign = self.callsign_input.text
+        unit = self.unit_input.text
+        platoon = self.platoon_input.text
+        position = self.position_input.text
+        clothing_size = self.clothing_size_input.text
+        shoe_size = self.shoe_size_input.text
+
+        if all([last_name, first_name, callsign, unit, platoon, position]):
+            fighter_id = generate_fighter_id(callsign, unit, position)
+            cursor.execute('''
+                INSERT INTO fighters 
+                (id, callsign, last_name, first_name, middle_name, phone_number, unit, platoon, position, clothing_size, shoe_size)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (fighter_id, callsign, last_name, first_name, middle_name, phone_number, unit, platoon, position, clothing_size, shoe_size))
+        
+            conn.commit()
+            self.popup.dismiss()
+
+            success_popup = Popup(title="Успех", content=Label(text="Боец успешно добавлен"), size_hint=(0.6, 0.4))
+            success_popup.open()
+        else:
+            error_popup = Popup(title="Ошибка", content=Label(text="Пожалуйста, заполните все обязательные поля"), size_hint=(0.6, 0.4))
+            error_popup.open()
+
+    def go_back(self, popup_to_close, callback=None):
+        """Функция для закрытия текущего окна и возврата на предыдущий экран."""
+        popup_to_close.dismiss()
+        if callback:
+            callback() 
+
+    def add_equipment(self, instance=None):
+        content = BoxLayout(orientation='vertical', padding=10)
+
+        # Кнопки для выбора типа экипировки
+        content = BoxLayout(orientation='vertical', padding=10)
+        equipment_categories = ['Одежда', 'Обувь', 'Защита', 'Оружие', 'Аптечка', 'Рюкзак', 'Рация', 'Прочее']
+        
+        for category in equipment_categories:
+            btn = Button(text=category, on_press=lambda x, c=category: self.open_subcategory(c))
+            content.add_widget(btn)
+
+        # Кнопка "Назад", которая возвращает на главный экран
+        back_button = Button(text="Назад", on_press=lambda x: self.go_back(self.equipment_popup, self.open_main_screen))
+        content.add_widget(back_button)
+        
+        self.equipment_popup = Popup(title="Выберите категорию экипировки", content=content, size_hint=(0.8, 0.8))
+        self.equipment_popup.open()
+
+    def open_main_screen(self):
+        """Функция для открытия главного экрана."""
+        content = BoxLayout(orientation='vertical', padding=10)
+
+    def open_subcategory(self, category):
+        # Закрываем текущее окно выбора категории
+        self.equipment_popup.dismiss()
+
+        # Если категория требует прямого открытия формы, сразу открываем соответствующую форму
+        if category == 'Оружие':
+            self.open_weapon_form()
+            return  # Прекращаем выполнение функции, чтобы не открывать подкатегории
+
+        elif category == 'Аптечка':
+            self.open_medkit_form(category)  # Отдельная функция для аптечек
+            return
+
+        elif category == 'Рюкзак':
+            self.open_backpack_form(category)  # Отдельная функция для рюкзаков
+            return
+
+        elif category == 'Рация':
+            self.open_radio_form()
+            return
+
+        elif category == 'Прочее':
+            self.open_misk_form(category)  # Отдельная функция для категории "Прочее"
+            return
+
+        # Если категория не требует прямого открытия формы, создаем окно для выбора подкатегории
+        else:
+            content = BoxLayout(orientation='vertical', padding=10)
+
+        if category == 'Одежда':
+            subcategories = ['Головной убор', 'Кофта', 'Форма', 'Нательное белье', 'Прочее']
+            for subcat in subcategories:
+                btn = Button(text=subcat, on_press=lambda x, sc=subcat: self.open_clothing_form(sc))
+                content.add_widget(btn)
+
+        elif category == 'Обувь':
+            shoe_types = ['Берцы', 'Кроссовки', 'Сапоги']
+            for shoe_type in shoe_types:
+                btn = Button(text=shoe_type, on_press=lambda x, st=shoe_type: self.open_shoe_form(st))
+                content.add_widget(btn)
+
+        elif category == 'Защита':
+            protection_types = ['Каска', 'Бронежилет']
+            for protection_type in protection_types:
+                btn = Button(text=protection_type, on_press=lambda x, pt=protection_type: self.open_protection_form(pt))
+                content.add_widget(btn) 
+
+        # Кнопка "Назад" для возврата к выбору категории
+        back_button = Button(text="Назад", on_press=lambda x: self.go_back(self.subcategory_popup, self.add_equipment))
+        content.add_widget(back_button)   
+
+        self.subcategory_popup = Popup(title=f"Выберите подкатегорию для {category}", content=content, size_hint=(0.8, 0.8))
+        self.subcategory_popup.open()
+
+    def open_clothing_form(self, subcategory):
+        self.subcategory_popup.dismiss()
+        content = BoxLayout(orientation='vertical', padding=10)
+
+        # Очистка старых спиннеров перед созданием новой формы
+        self.season_spinner = None
+        self.item_spinner = None
+        self.size_input = None
+        self.name_input = None
+
+        if subcategory == 'Головной убор':
+            self.season_spinner = Spinner(text="Сезон", values=["Лето", "Зима"])
+            self.item_spinner = Spinner(text="Тип", values=["Кепка", "Шапка", "Балаклава"])
+            self.name_input = TextInput(hint_text="Название головного убора")
+            self.size_input = TextInput(hint_text="Размер головного убора")
+
+            content.add_widget(self.season_spinner)
+            content.add_widget(self.item_spinner)
+            content.add_widget(self.name_input)
+            content.add_widget(self.size_input)
+
+        elif subcategory == 'Кофта':
+            self.name_input = TextInput(hint_text="Название кофты")
+            self.size_input = TextInput(hint_text="Размер")
+            content.add_widget(self.name_input)
+            content.add_widget(self.size_input)
+
+        elif subcategory == 'Форма':
+            self.season_spinner = Spinner(text="Сезон", values=["Лето", "Зима", "Зимнесезонная"])
+            self.name_input = TextInput(hint_text="Название формы")
+            self.size_input = TextInput(hint_text="Размер")
+            content.add_widget(self.season_spinner)
+            content.add_widget(self.name_input)
+            content.add_widget(self.size_input)
+
+        elif subcategory == 'Нательное белье':
+            self.name_input = TextInput(hint_text="Название")
+            self.size_input = TextInput(hint_text="Размер")
+            content.add_widget(self.name_input)
+            content.add_widget(self.size_input)
+
+        elif subcategory == 'Прочее':
+            self.name_input = TextInput(hint_text="Название")
+            content.add_widget(self.name_input)
+
+        # Кнопка "Назад" для возврата к подкатегориям
+        back_button = Button(text="Назад", on_press=lambda x: self.go_back(self.equipment_form_popup, lambda: self.open_subcategory('Одежда')))
+        content.add_widget(back_button)
+
+        # Кнопка "Сохранить"
+        save_button = Button(text="Сохранить", on_press=lambda x: self.save_equipment('Одежда', subcategory))
+        content.add_widget(save_button)
+
+        self.equipment_form_popup = Popup(title=f"Добавить {subcategory}", content=content, size_hint=(0.8, 0.8))
+        self.equipment_form_popup.open()
+
+    def open_shoe_form(self, shoe_type):
+        self.subcategory_popup.dismiss()
+        content = BoxLayout(orientation='vertical', padding=10)
+        season_spinner = Spinner(text="Сезон", values=["Лето", "Зима"])
+        self.name_input = TextInput(hint_text="Название обуви")
+        self.size_input = TextInput(hint_text="Размер")
+        content.add_widget(season_spinner)
+        content.add_widget(self.name_input)
+        content.add_widget(self.size_input)
+        self.season_spinner = season_spinner
+        save_button = Button(text="Сохранить", on_press=lambda x: self.save_equipment('Обувь', shoe_type))
+        content.add_widget(save_button)
+        self.equipment_form_popup = Popup(title=f"Добавить {shoe_type}", content=content, size_hint=(0.8, 0.8))
+        self.equipment_form_popup.open()
+
+    def open_protection_form(self, protection_type):
+        self.subcategory_popup.dismiss()
+        content = BoxLayout(orientation='vertical', padding=10)
+        
+        if protection_type == 'Каска':
+            self.name_input = TextInput(hint_text="Название каски")
+            self.size_input = TextInput(hint_text="Размер")
+            content.add_widget(self.name_input)
+            content.add_widget(self.size_input)
+
+        elif protection_type == 'Бронежилет':
+            self.name_input = TextInput(hint_text="Название бронежилета")
+            self.size_input = TextInput(hint_text="Размер")
+            plate_type_spinner = Spinner(text="Тип плит", values=["Тип 1", "Тип 2", "Тип 3"])
+            content.add_widget(self.name_input)
+            content.add_widget(self.size_input)
+            content.add_widget(plate_type_spinner)
+            self.plate_type_spinner = plate_type_spinner
+
+        save_button = Button(text="Сохранить", on_press=lambda x: self.save_equipment('Защита', protection_type))
+        content.add_widget(save_button)
+        self.equipment_form_popup = Popup(title=f"Добавить {protection_type}", content=content, size_hint=(0.8, 0.8))
+        self.equipment_form_popup.open()
+
+    def open_weapon_form(self):
+        content = BoxLayout(orientation='vertical', padding=10)
+        self.name_input = TextInput(hint_text="Название оружия")
+        self.number_input = TextInput(hint_text="Номер оружия")
+        self.weapon_type_spinner = Spinner(text="Тип оружия", values=["ММГ", "Боевое", "Холостое"])
+        content.add_widget(self.name_input)
+        content.add_widget(self.number_input)
+        content.add_widget(self.weapon_type_spinner)
+        save_button = Button(text="Сохранить", on_press=lambda x: self.save_equipment('Оружие'))
+        content.add_widget(save_button)
+         # Кнопка "Назад" для возврата к выбору категории
+        back_button = Button(text="Назад", on_press=lambda x: self.go_back(self.subcategory_popup, self.add_equipment))
+        content.add_widget(back_button)
+        self.equipment_form_popup = Popup(title="Добавить Оружие", content=content, size_hint=(0.8, 0.8))
+        self.equipment_form_popup.open()
+
+    def open_radio_form(self):
+        content = BoxLayout(orientation='vertical', padding=10)
+        self.name_input = TextInput(hint_text="Название рации")
+        self.number_input = TextInput(hint_text="Номер")
+        self.radio_type_spinner = Spinner(text="Тип рации", values=["Цифровая", "Аналоговая"])
+        content.add_widget(self.name_input)
+        content.add_widget(self.number_input)
+        content.add_widget(self.radio_type_spinner)
+        save_button = Button(text="Сохранить", on_press=lambda x: self.save_equipment('Рация'))
+        content.add_widget(save_button)
+         # Кнопка "Назад" для возврата к выбору категории
+        back_button = Button(text="Назад", on_press=lambda x: self.go_back(self.subcategory_popup, self.add_equipment))
+        content.add_widget(back_button)
+        self.equipment_form_popup = Popup(title="Добавить Рацию", content=content, size_hint=(0.8, 0.8))
+        self.equipment_form_popup.open()
+
+    def open_medkit_form(self, category):
+        """Форма для добавления аптечка."""
+        content = BoxLayout(orientation='vertical', padding=10)
+        self.name_input = TextInput(hint_text=f"Название {category.lower()}") 
+        content.add_widget(self.name_input)
+
+
+        # Кнопка "Сохранить"
+        save_button = Button(text="Сохранить", on_press=lambda x: self.save_equipment(category))
+        content.add_widget(save_button)
+
+        # Кнопка "Назад"
+        back_button = Button(text="Назад", on_press=lambda x: self.go_back(self.subcategory_popup, self.add_equipment))
+        content.add_widget(back_button)
+
+        self.equipment_form_popup = Popup(title=f"Добавить {category}", content=content, size_hint=(0.8, 0.8))
+        self.equipment_form_popup.open()
+
+    def open_misk_form(self, category):
+        """Форма для добавления в категорию 'Прочее'."""
+        content = BoxLayout(orientation='vertical', padding=10)
+        self.name_input = TextInput(hint_text=f"Название {category.lower()}")
+        content.add_widget(self.name_input)
+
+        save_button = Button(text="Сохранить", on_press=lambda x: self.save_equipment(category))
+        content.add_widget(save_button)
+
+        back_button = Button(text="Назад", on_press=lambda x: self.go_back(self.subcategory_popup, self.add_equipment))
+        content.add_widget(back_button)
+
+        self.equipment_form_popup = Popup(title=f"Добавить {category}", content=content, size_hint=(0.8, 0.8))
+        self.equipment_form_popup.open()
+
+    def open_backpack_form(self, category):
+        """Форма для добавления рюкзак."""
+        content = BoxLayout(orientation='vertical', padding=10)
+        self.name_input = TextInput(hint_text=f"Название {category.lower()}")
+        content.add_widget(self.name_input)
+
+        # Выбор типа рюкзака (медика или бойца)
+        backpack_spinner = Spinner(text="Тип рюкзака", values=["Рюкзак медика", "Рюкзак бойца"])
+        content.add_widget(backpack_spinner)
+        self.backpack_spinner = backpack_spinner
+
+        save_button = Button(text="Сохранить", on_press=lambda x: self.save_equipment(category))
+        content.add_widget(save_button)
+
+        back_button = Button(text="Назад", on_press=lambda x: self.go_back(self.subcategory_popup, self.add_equipment))
+        content.add_widget(back_button)
+
+        self.equipment_form_popup = Popup(title=f"Добавить {category}", content=content, size_hint=(0.8, 0.8))
+        self.equipment_form_popup.open()
+
+    def validate_fields(self, name, number, size, subtype):
+        return all([name, size, number, type, subtype])  
+
+    def save_equipment(self, category, subcategory=None):
+        # Получение данных из полей ввода
+        name = self.name_input.text if hasattr(self, 'name_input') else None
+        size = self.size_input.text if hasattr(self, 'size_input') else None
+
+        # Для категории "Оружие" и "Рация" получаем номер
+        if category in ["Оружие", "Рация"]:
+            manual_number = self.number_input.text.strip() if hasattr(self, 'number_input') else None
+        else:
+            manual_number = None  # Для других категорий номер не используется
+
+        # Определение подтипа (subtype) в зависимости от активного элемента
+        subtype = None
+
+        if category == "Одежда":
+            if subcategory == "Головной убор":
+                subtype = f"{self.season_spinner.text}, {self.item_spinner.text}" if self.season_spinner and self.item_spinner else None
+            elif subcategory == "Форма":
+                subtype = self.season_spinner.text if self.season_spinner else None
+        elif category == "Обувь":
+            subtype = self.season_spinner.text if self.season_spinner else None
+        elif category == "Защита":
+            if subcategory == "Бронежилет":
+                subtype = self.plate_type_spinner.text if self.plate_type_spinner else None
+        elif category == "Оружие":
+            subtype = self.weapon_type_spinner.text if self.weapon_type_spinner else None
+        elif category == "Рация":
+            subtype = self.radio_type_spinner.text if self.radio_type_spinner else None
+        elif category == "Рюкзак":
+            subtype = self.backpack_spinner.text if self.backpack_spinner else None
+
+       # Проверка на заполненность обязательных полей
+        if not name:
+            self.show_error_popup("Пожалуйста, заполните поле 'Название'.")
+            return
+
+        # Список категорий, для которых требуется генерация уникального номера и QR-кода
+        special_categories = ["Бронежилет", "Каска", "Аптечка", "Рюкзак", "Оружие", "Рация", "Защита"]
+
+        # Генерация уникального номера
+        def generate_equipment_number(name, equipment_type):
+            salt = f"{random.randint(1000, 9999)}{time.time()}"
+            equipment_data = f"{name}{equipment_type}{salt}{SECRET_KEY}"
+            equipment_number = hashlib.sha256(equipment_data.encode()).hexdigest()[:16]
+            return equipment_number
+
+        # Генерация QR-кода и сохранение его в виде изображения
+        def generate_qr_code(name):
+            qr = qrcode.make(number)  # Создаем QR-код на основе данных
+            qr_filename = f"{QR_FOLDER}/{name}.png"  # Используем данные для названия файла
+            qr.save(qr_filename)
+            return qr_filename
+
+        # Инициализация переменных
+        number = None
+        qr_path = None
+
+        # Генерация уникального номера и QR-кода для специальных категорий
+        if category in special_categories:
+            number = generate_equipment_number(name, category)  # Генерация ID
+            qr_data = f"{name}, {number}, {category}, {subcategory if subcategory else ''}"
+            qr_path = generate_qr_code(qr_data)  # Генерация QR-кода с данными
+
+        date_added = datetime.now().strftime('%d-%m-%y')    
+
+        # Сохранение данных в базе данных
+        cursor.execute("""
+            INSERT INTO equipment (category, subcategory, name, number, size, subtype, date_added, manual_number) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (category, subcategory, name, number, size, subtype, date_added, manual_number))
+        conn.commit()
+
+        # Закрыть всплывающее окно после добавления экипировки
+        self.equipment_form_popup.dismiss()
+
+        # Отобразить сообщение об успешном добавлении
+        popup = Popup(title="Успех", content=Label(text="Экипировка успешно добавлена"), size_hint=(0.6, 0.4))
+        popup.open()
+
+    def show_error_popup(self, message):
+        error_content = BoxLayout(orientation='vertical', padding=10)
+        error_label = Label(text=message)
+        close_button = Button(text="Закрыть", size_hint=(1, 0.5), on_press=lambda x: self.error_popup.dismiss())
+        error_content.add_widget(error_label)
+        error_content.add_widget(close_button)
+        self.error_popup = Popup(title="Ошибка", content=error_content, size_hint=(0.7, 0.4))
+        self.error_popup.open()
+
+    def view_fighters(self, instance):
+        cursor.execute('SELECT * FROM fighters')
+        fighters = cursor.fetchall()
+
+        self.show_fighters(fighters)
+
+    def view_fighters(self, instance):
+        # Запрашиваем всех бойцов и сортируем их по фамилии в алфавитном порядке
+        cursor.execute("SELECT * FROM fighters ORDER BY last_name ASC")
+        fighters = cursor.fetchall()
+
+        self.show_fighters(fighters)
+
+    def show_fighters(self, fighters):
+        layout = BoxLayout(orientation='vertical', padding=10)
+
+        title_label = Label(text="Личный состав", size_hint=(1, 0.1), font_size=24)
+        layout.add_widget(title_label)
+
+        search_layout = BoxLayout(orientation='horizontal', size_hint=(1, 0.1))
+
+        # Поле для поиска
+        self.search_input = TextInput(hint_text="Поиск по позывному, роте или ФИО", size_hint_x=0.7)
+        search_layout.add_widget(self.search_input)
+
+        # Кнопка для выполнения поиска
+        search_button = Button(text="Поиск", size_hint_x=0.3, on_press=self.search_fighter)
+        search_layout.add_widget(search_button)
+
+        layout.add_widget(search_layout)
+
+        table_layout = GridLayout(cols=1, padding=10, spacing=10, size_hint_y=None)
+        table_layout.bind(minimum_height=table_layout.setter('height'))
+
+        # Заголовки таблицы
+        headers = ["ID", "Позывной", "Фамилия", "Имя", "Отчество", "Телефон", "Рота", "Взвод", "Должность", "Одежда", "Обувь"]
+        header_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+        
+        for index, header in enumerate(headers):
+            label = Label(text=header, bold=True, size_hint_x=0.1)
+            
+            # Добавляем возможность сортировки при нажатии на заголовок "Рота"
+            if header == "Рота":
+                sort_button = Button(text=header, bold=True, size_hint_x=0.1, on_press=self.sort_by_unit)
+                header_layout.add_widget(sort_button)
+            else:
+                header_layout.add_widget(label)
+        
+        header_layout.add_widget(Label(text="", size_hint_x=0.1))  # Для колонки "Удалить"
+        table_layout.add_widget(header_layout)
+
+        # Отображаем список бойцов
+        for fighter in fighters:
+            fighter_id, callsign, last_name, first_name, middle_name, phone_number, unit, platoon, position, clothing_size, shoe_size = fighter
+            row_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+
+            for data in [fighter_id, callsign, last_name, first_name, middle_name, phone_number, unit, platoon, position, clothing_size, shoe_size]:
+                row_layout.add_widget(Label(text=str(data), size_hint_x=0.1))
+            
+            delete_button = Button(text="Удалить", size_hint_x=0.1)
+            delete_button.bind(on_press=lambda x, fighter_id=fighter_id: self.confirm_delete_fighter(fighter_id))
+            row_layout.add_widget(delete_button)
+
+            table_layout.add_widget(row_layout)
+
+        scroll = ScrollView(size_hint=(1, 0.8))
+        scroll.add_widget(table_layout)
+
+        layout.add_widget(scroll)
+
+        popup = Popup(title="Личный состав", content=layout, size_hint=(0.9, 0.9))
+        popup.open()
+
+    def search_fighter(self, instance):
+        search_text = self.search_input.text
+
+        # Формируем запрос с условиями поиска и сортировкой по фамилии
+        query = """
+            SELECT * FROM fighters 
+            WHERE callsign LIKE ? OR 
+                unit LIKE ? OR 
+                last_name LIKE ? OR 
+                first_name LIKE ? OR 
+                middle_name LIKE ?
+            ORDER BY last_name ASC
+        """
+
+        # Используем одинаковое значение поиска для всех параметров
+        search_pattern = f"%{search_text}%"
+        cursor.execute(query, (search_pattern, search_pattern, search_pattern, search_pattern, search_pattern))
+        fighters = cursor.fetchall()
+
+        self.show_fighters(fighters)
+
+    def sort_by_unit(self, instance):
+        # Переключаем порядок сортировки (ASC/DESC)
+        self.current_sort_order = "DESC" if getattr(self, 'current_sort_order', 'ASC') == "ASC" else "ASC"
+    
+        # Сортируем бойцов по роте и, если одинаково, по фамилии
+        query = f"""
+            SELECT * FROM fighters 
+            ORDER BY unit {self.current_sort_order}, last_name ASC
+        """
+    
+        cursor.execute(query)
+        fighters = cursor.fetchall()
+
+        # Обновляем отображение бойцов с учетом новой сортировки
+        self.show_fighters(fighters)
+
+    def confirm_delete_fighter(self, fighter_id):
+        content = BoxLayout(orientation='vertical', padding=10)
+        content.add_widget(Label(text="Вы уверены, что хотите удалить бойца?"))
+
+        delete_button = Button(text="Удалить", on_press=lambda x: self.delete_fighter(fighter_id))
+        content.add_widget(delete_button)
+
+        cancel_button = Button(text="Отмена", on_press=lambda x: self.popup.dismiss())
+        content.add_widget(cancel_button)
+
+        self.popup = Popup(title="Подтверждение", content=content, size_hint=(0.6, 0.4))
+        self.popup.open()
+
+    def delete_fighter(self, fighter_id):
+        cursor.execute('DELETE FROM fighters WHERE id = ?', (fighter_id,))
+        conn.commit()
+
+        self.popup.dismiss()
+
+        popup = Popup(title="Успех", content=Label(text="Боец успешно удален"), size_hint=(0.6, 0.4))
+        popup.open()
+
+        # Обновляем список бойцов после удаления
+        self.view_fighters(None)
+
+
+    def view_equipment(self, instance):
+        content = BoxLayout(orientation='vertical', padding=10)
+
+        # Добавляем все типы экипировки в список кнопок
+        equipment_types = ['Одежда', 'Обувь', 'Защита', 'Оружие', 'Аптечка', 'Рюкзак', 'Рация', 'Прочее']
+
+        # Создаем кнопку для каждого типа экипировки
+        for equipment in equipment_types:
+            btn = Button(text=equipment, on_press=lambda x, e=equipment: self.show_equipment_data(e))
+            content.add_widget(btn)
+
+
+        # Создаем и открываем всплывающее окно для выбора типа экипировки
+        popup = Popup(title="Выберите тип экипировки", content=content, size_hint=(0.8, 0.8))
+        popup.open()
+
+    def show_equipment_data(self, equipment_type):
+        # Категории, для которых отображаются все элементы (и выданные, и невыданные)
+        highlight_categories = ['Оружие', 'Аптечка', 'Рация', 'Защита', 'Рюкзак']
+
+        # Формирование запроса данных
+        if equipment_type in highlight_categories:
+            # Для этих категорий отображаем все элементы
+            cursor.execute('SELECT id, category, name, number, size, date_added, subtype, manual_number, is_issued FROM equipment WHERE category = ?', (equipment_type,))
+        else:
+            # Для остальных категорий отображаем только невыданные элементы
+            cursor.execute('SELECT id, category, name, number, size, date_added, subtype, manual_number, is_issued FROM equipment WHERE category = ? AND is_issued = 0', (equipment_type,))
+
+        equipment_data = cursor.fetchall()
+
+        # Подсчёт общего количества элементов
+        cursor.execute('SELECT COUNT(*) FROM equipment WHERE category = ? AND is_issued = 0', (equipment_type,))
+        equipment_count = cursor.fetchone()[0]
+
+        # Основной макет для отображения данных
+        layout = BoxLayout(orientation='vertical', padding=10)
+
+        # Заголовок с названием типа экипировки
+        title_label = Label(text=f"Экипировка: {equipment_type}", size_hint=(1, 0.1), font_size=24)
+        layout.add_widget(title_label)
+
+        # Количество элементов выбранного типа
+        count_label = Label(text=f"Общее количество: {equipment_count}", size_hint=(1, 0.1), font_size=18)
+        layout.add_widget(count_label)
+
+        # Табличное представление данных
+        table_layout = GridLayout(cols=1, padding=10, spacing=10, size_hint_y=None)
+        table_layout.bind(minimum_height=table_layout.setter('height'))
+
+
+        # Устанавливаем заголовки таблицы по умолчанию на случай, если категория не найдена
+        # Устанавливаем заголовки таблицы
+        headers = ["Название", "ID"]
+
+        if equipment_type == 'Одежда':
+            headers = ["Название", "Размер", "Тип (зима, лето, межсезонье)", "Дата поставки"]
+        elif equipment_type == 'Обувь':
+            headers = ["Название", "Размер", "Тип обуви", "Сезон", "Дата поставки"]
+        elif equipment_type == 'Защита':
+            headers = ["Название", "Размер", "Тип плит", "ID", "Дата поставки"]
+        elif equipment_type == 'Оружие':
+            headers = ["Название", "Номер", "Индивидуальный ID", "Тип оружия", "Дата поставки"]
+        elif equipment_type == 'Аптечка':
+            headers = ["Название", "Индивидуальный ID", "Дата поставки"]
+        elif equipment_type == 'Рюкзак':
+            headers = ["Название", "Индивидуальный ID", "Тип рюкзака", "Дата поставки"]
+        elif equipment_type == 'Рация':
+            headers = ["Название", "Номер", "Тип рации", "Индивидуальный ID", "Дата поставки"]
+        elif equipment_type == 'Прочее':
+            headers = ["Название", "Дата поставки"]
+
+        # Добавляем заголовки таблицы
+        header_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+        for header in headers:
+            header_layout.add_widget(Label(text=header, bold=True, size_hint_x=0.2, halign='center', valign='middle'))
+        table_layout.add_widget(header_layout)
+
+        # Заполнение таблицы данными по экипировке
+        for equipment in equipment_data:
+            equipment_id, category, name, number, size, date_added, subtype, manual_number, is_issued = equipment
+            row_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+
+            # Установка цвета текста для названия в зависимости от статуса выдачи
+            name_color = [0.8, 0.2, 0.2, 1] if is_issued and equipment_type in ['Оружие', 'Аптечка', 'Рация', 'Защита', 'Рюкзак'] else [1, 1, 1, 1]
+
+            # Добавление имени с цветом
+            row_layout.add_widget(Label(
+                text=name,
+                size_hint_x=0.33,
+                halign='center',
+                valign='middle',
+                color=name_color))
+            
+            # Отображаем данные в зависимости от типа экипировки
+            if equipment_type == 'Одежда':
+                row_layout.add_widget(Label(text=size if size else '-', size_hint_x=0.33, halign='center', valign='middle'))
+                row_layout.add_widget(Label(text=subtype if subtype else '-', size_hint_x=0.33, halign='center', valign='middle'))
+                row_layout.add_widget(Label(text=date_added if date_added else '-', size_hint_x=0.33, halign='center', valign='middle'))
+
+            elif equipment_type == 'Обувь':
+                row_layout.add_widget(Label(text=size if size else '-', size_hint_x=0.33, halign='center', valign='middle'))
+                row_layout.add_widget(Label(text=category if category else '-', size_hint_x=0.33, halign='center', valign='middle'))  # Тип обуви
+                row_layout.add_widget(Label(text=subtype if subtype else '-', size_hint_x=0.33, halign='center', valign='middle'))  # Сезон
+                row_layout.add_widget(Label(text=date_added if date_added else '-', size_hint_x=0.33, halign='center', valign='middle'))
+
+            elif equipment_type == 'Защита':
+                row_layout.add_widget(Label(text=size if size else '-', size_hint_x=0.33, halign='center', valign='middle'))
+                row_layout.add_widget(Label(text=subtype if subtype else '-', size_hint_x=0.33, halign='center', valign='middle'))
+                row_layout.add_widget(Label(text=number if number else '-', size_hint_x=0.33, halign='center', valign='middle'))
+                row_layout.add_widget(Label(text=date_added if date_added else '-', size_hint_x=0.33, halign='center', valign='middle'))
+
+            elif equipment_type == 'Оружие':
+                row_layout.add_widget(Label(text=str(manual_number), size_hint_x=0.33, halign='center', valign='middle'))  # Индивидуальный ID
+                row_layout.add_widget(Label(text=str(number), size_hint_x=0.33, halign='center', valign='middle'))
+                row_layout.add_widget(Label(text=subtype if subtype else '-', size_hint_x=0.33, halign='center', valign='middle'))  # Тип оружия
+                row_layout.add_widget(Label(text=date_added if date_added else '-', size_hint_x=00.33, halign='center', valign='middle'))
+
+            elif equipment_type == 'Аптечка':
+                row_layout.add_widget(Label(text=str(number), size_hint_x=0.33, halign='center', valign='middle'))  # Индивидуальный ID
+                row_layout.add_widget(Label(text=date_added if date_added else '-', size_hint_x=0.33, halign='center', valign='middle'))
+
+            elif equipment_type == 'Рюкзак':
+                row_layout.add_widget(Label(text=str(number), size_hint_x=0.33, halign='center', valign='middle'))  # Индивидуальный ID
+                row_layout.add_widget(Label(text=subtype if subtype else '-', size_hint_x=0.33, halign='center', valign='middle'))  # Тип рюкзака
+                row_layout.add_widget(Label(text=date_added if date_added else '-', size_hint_x=0.33, halign='center', valign='middle'))
+
+            elif equipment_type == 'Рация':
+                row_layout.add_widget(Label(text=str(manual_number), size_hint_x=0.33, halign='center', valign='middle'))
+                row_layout.add_widget(Label(text=subtype if subtype else '-', size_hint_x=0.33, halign='center', valign='middle'))  # Тип рации
+                row_layout.add_widget(Label(text=str(number), size_hint_x=0.33, halign='center', valign='middle'))  # Индивидуальный ID
+                row_layout.add_widget(Label(text=date_added if date_added else '-', size_hint_x=0.33, halign='center', valign='middle'))
+
+            elif equipment_type == 'Прочее':
+                row_layout.add_widget(Label(text=date_added if date_added else '-', size_hint_x=0.33, halign='center', valign='middle'))
+
+            table_layout.add_widget(row_layout)
+
+        # Прокрутка для таблицы
+        scroll = ScrollView(size_hint=(1, 0.9))
+        scroll.add_widget(table_layout)
+        layout.add_widget(scroll)
+
+        # Открытие всплывающего окна с информацией по выбранной экипировке
+        popup = Popup(title=f"Экипировка: {equipment_type}", content=layout, size_hint=(0.9, 0.9))
+        popup.open()
+
+
+# Экран для пользователя с ограниченными правами
+class UserScreen(Screen):
+    def __init__(self, **kwargs):
+        super(UserScreen, self).__init__(**kwargs)
+        layout = BoxLayout(orientation='vertical', padding=10)
+
+        add_equipment_btn = Button(text="Выдать/Принять форму", on_press=self.add_equipment)
+        layout.add_widget(add_equipment_btn)
+
+        view_equipment_btn = Button(text="Просмотр экипировки", on_press=self.view_equipment)
+        layout.add_widget(view_equipment_btn)
+
+        self.add_widget(layout)
+
+    def add_equipment(self, instance):
+        layout = BoxLayout(orientation='vertical', padding=10)
+        popup_content = BoxLayout(orientation='vertical', padding=10)
+
+        popup_content.add_widget(Label(text="Тип экипировки:"))
+        self.equipment_type_input = TextInput(multiline=False)
+        popup_content.add_widget(self.equipment_type_input)
+
+        popup_content.add_widget(Label(text="Название:"))
+        self.equipment_name_input = TextInput(multилине=False)
+        popup_content.add_widget(self.equipment_name_input)
+
+        popup_content.add_widget(Label(text="Размер:"))
+        self.equipment_size_input = TextInput(multiline=False)
+        popup_content.add_widget(self.equipment_size_input)
+
+        save_button = Button(text="Сохранить", on_press=self.save_equipment)
+        popup_content.add_widget(save_button)
+
+        popup = Popup(title="Добавить экипировку", content=popup_content, size_hint=(0.8, 0.8))
+        popup.open()
+
+    def save_equipment(self, instance):
+        equipment_type = self.equipment_type_input.text
+        equipment_name = self.equipment_name_input.text
+        equipment_size = self.equipment_size_input.text
+
+        equipment_number = generate_equipment_number(equipment_name, equipment_type)
+
+        cursor.execute('INSERT INTO equipment (type, name, number, size, subtype) VALUES (?, ?, ?, ?, ?)',
+                       (equipment_type, equipment_name, equipment_number, equipment_size, equipment_type))
+        conn.commit()
+
+        popup = Popup(title="Успех", content=Label(text="Экипировка успешно добавлена!"), size_hint=(0.6, 0.4))
+        popup.open()
+
+    def view_equipment(self, instance):
+        layout = GridLayout(cols=1, padding=10, spacing=10, size_hint_y=None)
+        layout.bind(minimum_height=layout.setter('height'))
+
+        cursor.execute('SELECT * FROM equipment')
+        equipment_list = cursor.fetchall()
+
+        for equipment in equipment_list:
+            layout.add_widget(Label(text=f"ID: {equipment[0]}, Тип: {equipment[1]}, Название: {equipment[2]}, Номер: {equipment[3]}, Размер: {equipment[4]}"))
+
+        scrollview = ScrollView(size_hint=(1, None), size=(400, 400))
+        scrollview.add_widget(layout)
+
+        popup = Popup(title="Экипировка", content=scrollview, size_hint=(0.8, 0.8))
+        popup.open()
+
+
+class FightersApp(App):
+    def build(self):
+        sm = ScreenManager()
+        sm.add_widget(LoginScreen(name='login'))
+        sm.add_widget(AdminScreen(name='admin'))  # Экран для администратора
+        sm.add_widget(UserScreen(name='user'))  # Экран для ограниченного пользователя
+        return sm
+
+if __name__ == '__main__':
+    FightersApp().run()
